@@ -1,0 +1,168 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+require 'progressbar'
+require 'trollop'
+require 'em-http'
+require 'sha1'
+require 'ruby-debug'
+
+class HttpBenchmarker
+
+  class << self
+    attr_accessor :generator
+  end
+
+  def initialize(options = {})
+    options.each_pair do |k,v|
+      self.instance_variable_set("@#{k}".to_sym,v)
+    end 
+    @in_progress = 0
+    @total_attempted_requests = 0
+    @disconnected = 0
+    @generator_options = options[:param].inject({}){|hash,kv| k,v=kv.split(":"); hash[k.to_sym]=v; hash}
+    @responses = []
+    @succeeded = 0
+    @failed = 0
+    @progress_bar = ProgressBar.new("requests", @num_requests)
+  end
+
+  def run
+    EventMachine.epoll
+    EventMachine.run do
+      make_request 
+    end
+  end
+  
+  def make_request
+    if !finished? and @in_progress < @concurrency and @total_attempted_requests < @num_requests
+      request = self.class.generator.generate @generator_options
+      time_start = Time.now
+      @first_request_time ||= time_start
+      url = "http://#{@host}:#{@port}#{request[:uri]}"
+      if @debug
+        $stderr.puts "#{request[:method].to_s.upcase} #{url}"
+      end
+      http = EventMachine::HttpRequest.new(url).send request[:method], :body => request[:data]
+      @in_progress += 1
+      @total_attempted_requests += 1
+      http.callback do 
+        @progress_bar.inc
+        @succeeded += 1
+        @in_progress -= 1
+        time_now = Time.now
+        @last_request_completed_time = time_now
+        @responses << {
+          :success => true, 
+          :status => http.response_header.status, 
+          :elapsed_time => time_now - time_start
+        }
+        report if finished?
+      end
+      http.errback do |foo|
+        @progress_bar.inc
+        @failed += 1
+        @in_progress -= 1
+        time_now = Time.now
+        @last_request_completed_time = time_now
+        @responses << {
+          :success => false, 
+          :status => (http.response_header.status rescue nil), 
+          :elapsed_time => time_now - time_start
+        }
+        report if finished?
+      end
+    end
+    # next_tick throttles the CPU, so we use a timer instead. Unfortunately
+    # using a timer caps the throughput.  Need to investigate.
+    EventMachine.add_timer(0.001) { make_request } if not finished?
+  end
+
+  def finished?
+    @total_attempted_requests >= @num_requests && @in_progress == 0
+  end
+
+  def report
+    EventMachine.stop
+    @progress_bar.finish
+    stats
+  end
+
+  # A 'successful' request is one that was handled by the 'callback' handler, not
+  # the 'errback' handler.  It does not imply anything about the status code of the
+  # HTTP request itself. The 'errback' is merely indicates a lower-level connection
+  # problem or errors parsing HTTP responses.
+  def successful_requests
+    @successful_requests ||= @responses.select{|r| r[:success] }
+  end
+
+  def statuses
+    successful_requests.map{|r| r[:status] }.uniq.sort
+  end
+
+  def requests_grouped_by_status
+    successful_requests.group_by{|r| r[:status] }
+  end
+
+  def stats
+    elapsed_time = @last_request_completed_time - @first_request_time
+    puts ("
+      Made a total of #{@total_attempted_requests} HTTP requests.
+      __#{@succeeded} requests succeeded.
+      __#{@failed} requests failed.\n" + 
+    "Time taken for #{@num_requests} was #{elapsed_time} seconds.\n\n" + 
+      (
+        requests_grouped_by_status.map do |group,members|
+          timings = members.map{|m| m[:elapsed_time] }
+          "HTTP Status #{group}
+          ---------------------
+          # Requests: #{members.size}
+          Requests per second: #{members.size / elapsed_time}.
+          Timing Statistics (seconds):
+          __Mean: #{timings.average rescue "ERR"}
+          __Variance: #{timings.sample_variance rescue "ERR"}
+          __Standard Deviation: #{timings.standard_deviation rescue "ERR"}
+          __Fastest: #{timings.min rescue "ERR"}
+          __Slowest: #{timings.max rescue "ERR"}\n\n"
+        end.join("\n\n")
+      )
+    ).gsub(/^[ ]+/,'').gsub(/__/,'  ')
+  end
+end
+
+module Enumerable
+  def sum
+    return self.inject(0){|acc,i|acc +i}
+  end
+  def average
+    return self.sum/self.length.to_f
+  end
+  def sample_variance
+    avg=self.average
+    sum=self.inject(0){|acc,i|acc +(i-avg)**2}
+    return(1/self.length.to_f*sum)
+  end
+  def standard_deviation
+    return Math.sqrt(self.sample_variance)
+  end
+end
+
+if __FILE__ == $0
+  opts = Trollop::options do
+    opt :host, "Dynamo-server host", :type => :string, :required => true
+    opt :port, "Dynamo-server port", :type => :int, :default => 80
+    opt :num_requests, "Number of requests to send to dynamo-server", :default => 15, :type => :int
+    opt :concurrency, "Number of concurrent requests to send to dynamo-server", :default => 20, :type => :int
+    opt :generator, "Some Ruby code that generates the requests", :type => :string, :required => true
+    opt :param, "Specify parameters to your generator script like --param key:value. Can be used multiple times", :type => :string, :multi => true, :require => false
+    opt :debug, "Prints requests to the console", :type => :flag
+  end
+ 
+  benchmarker = HttpBenchmarker.new(opts)
+  begin
+    load(opts[:generator])
+    benchmarker.run
+  rescue LoadError
+    $stderr.puts "unable to load request generator: #{$!.message}"
+  end
+end
